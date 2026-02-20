@@ -60,7 +60,7 @@ async def get_or_response(user_text, history=None):
 
     async with ClientSession() as session:
         try:
-            async with session.post(OR_URL, json=payload, headers=headers, timeout=30) as response:
+            async with session.post(OR_URL, json=payload, headers=headers, timeout=90) as response:
                 if response.status == 200:
                     data = await response.json()
                     if 'choices' in data and len(data['choices']) > 0:
@@ -185,5 +185,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
