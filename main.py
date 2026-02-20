@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiohttp import ClientSession
 from dotenv import load_dotenv
 
@@ -25,7 +25,6 @@ SYSTEM_PROMPT = """
 Общайся неформально, кратко, по-человечески. Можешь шутить, иронизировать.
 Избегай канцеляризмов. Ты воспринимаешь мир как равноправный партнер.
 Ты участвуешь в групповом чате. Отвечай только если обращаются к тебе или отвечают на твое сообщение.
-Если тебя не упоминают и не отвечают тебе — молчи.
 """
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -76,22 +75,35 @@ async def get_or_response(user_text, history=None):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    # Получаем имя бота динамически, если оно нужно в сообщении
+    bot_info = await bot.get_me()
     chat_type = "в группе" if message.chat.type != "private" else "в личке"
-    await message.answer(f"Привет! Я в чате ({chat_type}). \nЧтобы я ответил, упомяни меня (@{bot.username}) или ответь реплаем на мое сообщение.")
-    logger.info(f"Start от {message.from_user.id} в чате {message.chat.id}")
+    await message.answer(f"Привет! Я в чате ({chat_type}). \nЧтобы я ответил, упомяни меня (@{bot_info.username}) или ответь реплаем на мое сообщение.")
+    logger.info(f"Команда /start от {message.from_user.id}")
 
 # Фильтр: Сообщение должно содержать упоминание бота ИЛИ быть ответом (reply) на сообщение бота
-@dp.message(F.text, lambda message: (bot.username in message.text) or (message.reply_to_message and message.reply_to_message.from_user.id == bot.id))
+# Используем магическое значение bot.id для проверки reply, это работает всегда
+@dp.message(F.text, lambda message: (message.text is not None and hasattr(message, 'entities') and any(entity.type == 'mention' and entity.url and bot.username_in_url(entity.url) for entity in message.entities)) or (message.reply_to_message and message.reply_to_message.from_user.id == bot.id))
 async def handle_chat_message(message: types.Message):
+    # Упрощенная проверка на упоминание через текст, так как парсинг entities может быть сложным
+    # Просто проверяем наличие строки @<username> в тексте, но username мы узнаем ниже
+    bot_info = await bot.get_me()
+    username = bot_info.username
+    
+    # Проверка: есть ли упоминание ИЛИ это ответ нам
+    is_mentioned = f"@{username}" in message.text
+    is_reply_to_me = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
+
+    if not is_mentioned and not is_reply_to_me:
+        return # Игнорируем, если не к нам
+
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Очищаем текст от упоминания, чтобы бот не повторял "@bot ..."
     text = message.text
-    if bot.username in text:
-        text = text.replace(f"@{bot.username}", "").strip()
+    if is_mentioned:
+        text = text.replace(f"@{username}", "").strip()
     
-    # Если это ответ на сообщение, добавим контекст "кто ответил"
     prefix = ""
     if message.reply_to_message:
         replier_name = message.reply_to_message.from_user.first_name
@@ -100,13 +112,10 @@ async def handle_chat_message(message: types.Message):
     
     full_prompt = prefix + text
     
-    logger.info(f"Чат {chat_id}: Пользователь {user_id} сказал: {full_prompt[:50]}...")
+    logger.info(f"Чат {chat_id}: Обработка сообщения от {user_id}")
     
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # Используем уникальный ключ для истории: комбинация chat_id и user_id, 
-    # но для простоты в групповых чатах часто хранят общую историю чата или историю диалога с конкретным юзером.
-    # Сделаем историю общей для чата, чтобы он помнил контекст беседы в группе.
     history_key = f"group_{chat_id}"
     
     if history_key not in user_histories:
@@ -121,12 +130,11 @@ async def handle_chat_message(message: types.Message):
         user_histories[history_key] = user_histories[history_key][-20:]
     
     try:
-        # В группах лучше отвечать с цитированием (reply), чтобы было понятно, кому ответ
         await message.answer(ai_response, reply_to_message=message)
     except Exception as e:
         logger.error(f"Ошибка отправки в чат: {e}")
 
-# Обработка личных сообщений (осталась как была)
+# Обработка личных сообщений
 @dp.message(F.text, lambda message: message.chat.type == "private")
 async def handle_private_message(message: types.Message):
     user_id = message.from_user.id
@@ -149,7 +157,14 @@ async def handle_private_message(message: types.Message):
     await message.answer(ai_response)
 
 async def main():
-    logger.info(f"Запуск бота {bot.username} для чатов и лички...")
+    # Сначала делаем get_me, чтобы инициализировать бота и узнать username
+    try:
+        bot_me = await bot.get_me()
+        logger.info(f"Запуск бота @{bot_me.username} (ID: {bot_me.id}) для чатов и лички...")
+    except Exception as e:
+        logger.error(f"Не удалось получить информацию о боте: {e}")
+        return
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
