@@ -3,6 +3,8 @@ import logging
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiohttp import ClientSession
 from dotenv import load_dotenv
 
@@ -12,8 +14,6 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Модель: Qwen 2.5 72B (Бесплатная)
 MODEL_NAME = "qwen/qwen-2.5-72b-instruct:free" 
 
 if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
@@ -30,9 +30,13 @@ SYSTEM_PROMPT = """
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TELEGRAM_TOKEN)
+# Инициализация бота
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 user_histories = {}
+
+# Глобальная переменная для хранения username, чтобы не дергать API каждый раз
+BOT_USERNAME = ""
 
 async def get_or_response(user_text, history=None):
     headers = {
@@ -70,73 +74,33 @@ async def get_or_response(user_text, history=None):
                     logger.error(f"Ошибка OpenRouter: {response.status} - {error_text}")
                     return f"Ошибка связи (Status: {response.status})."
         except Exception as e:
-            logger.error(f"Критическая ошибка: {e}")
+            logger.error(f"Критическая ошибка OpenRouter: {e}")
             return "Что-то пошло не так с соединением."
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Получаем имя бота динамически, если оно нужно в сообщении
-    bot_info = await bot.get_me()
     chat_type = "в группе" if message.chat.type != "private" else "в личке"
-    await message.answer(f"Привет! Я в чате ({chat_type}). \nЧтобы я ответил, упомяни меня (@{bot_info.username}) или ответь реплаем на мое сообщение.")
+    await message.answer(f"Привет! Я в чате ({chat_type}). \nЧтобы я ответил, упомяни меня (@{BOT_USERNAME}) или ответь реплаем на мое сообщение.")
     logger.info(f"Команда /start от {message.from_user.id}")
 
-# Фильтр: Сообщение должно содержать упоминание бота ИЛИ быть ответом (reply) на сообщение бота
-# Используем магическое значение bot.id для проверки reply, это работает всегда
-@dp.message(F.text, lambda message: (message.text is not None and hasattr(message, 'entities') and any(entity.type == 'mention' and entity.url and bot.username_in_url(entity.url) for entity in message.entities)) or (message.reply_to_message and message.reply_to_message.from_user.id == bot.id))
-async def handle_chat_message(message: types.Message):
-    # Упрощенная проверка на упоминание через текст, так как парсинг entities может быть сложным
-    # Просто проверяем наличие строки @<username> в тексте, но username мы узнаем ниже
-    bot_info = await bot.get_me()
-    username = bot_info.username
-    
-    # Проверка: есть ли упоминание ИЛИ это ответ нам
-    is_mentioned = f"@{username}" in message.text
+@dp.message(F.text)
+async def handle_message(message: types.Message):
+    # Если это личка - обрабатываем всегда
+    if message.chat.type == "private":
+        await process_private_message(message)
+        return
+
+    # Если группа - проверяем условия
+    is_mentioned = BOT_USERNAME and f"@{BOT_USERNAME}" in message.text
     is_reply_to_me = message.reply_to_message and message.reply_to_message.from_user.id == bot.id
 
-    if not is_mentioned and not is_reply_to_me:
-        return # Игнорируем, если не к нам
+    if is_mentioned or is_reply_to_me:
+        await process_group_message(message, is_mentioned)
+    else:
+        # Игнорируем сообщения в группе, если не к нам
+        pass
 
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    text = message.text
-    if is_mentioned:
-        text = text.replace(f"@{username}", "").strip()
-    
-    prefix = ""
-    if message.reply_to_message:
-        replier_name = message.reply_to_message.from_user.first_name
-        original_text = message.reply_to_message.text or "(медиа/стикер)"
-        prefix = f"(Ответ пользователю {replier_name} на сообщение: '{original_text}')\n"
-    
-    full_prompt = prefix + text
-    
-    logger.info(f"Чат {chat_id}: Обработка сообщения от {user_id}")
-    
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    history_key = f"group_{chat_id}"
-    
-    if history_key not in user_histories:
-        user_histories[history_key] = []
-    
-    ai_response = await get_or_response(full_prompt, user_histories[history_key])
-    
-    user_histories[history_key].append({"role": "user", "content": full_prompt})
-    user_histories[history_key].append({"role": "assistant", "content": ai_response})
-    
-    if len(user_histories[history_key]) > 20:
-        user_histories[history_key] = user_histories[history_key][-20:]
-    
-    try:
-        await message.answer(ai_response, reply_to_message=message)
-    except Exception as e:
-        logger.error(f"Ошибка отправки в чат: {e}")
-
-# Обработка личных сообщений
-@dp.message(F.text, lambda message: message.chat.type == "private")
-async def handle_private_message(message: types.Message):
+async def process_private_message(message: types.Message):
     user_id = message.from_user.id
     user_text = message.text
     logger.info(f"Личка от {user_id}: {user_text[:50]}...")
@@ -154,17 +118,69 @@ async def handle_private_message(message: types.Message):
     if len(user_histories[user_id]) > 20:
         user_histories[user_id] = user_histories[user_id][-20:]
     
-    await message.answer(ai_response)
+    try:
+        await message.answer(ai_response)
+    except Exception as e:
+        logger.error(f"Ошибка отправки в личку: {e}")
+
+async def process_group_message(message: types.Message, is_mentioned: bool):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    text = message.text
+    if is_mentioned and BOT_USERNAME:
+        text = text.replace(f"@{BOT_USERNAME}", "").strip()
+    
+    prefix = ""
+    if message.reply_to_message:
+        replier_name = message.reply_to_message.from_user.first_name
+        original_text = message.reply_to_message.text or "(медиа/стикер)"
+        prefix = f"(Ответ пользователю {replier_name} на сообщение: '{original_text}')\n"
+    
+    full_prompt = prefix + text
+    logger.info(f"Чат {chat_id}: Обработка от {user_id}")
+    
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    history_key = f"group_{chat_id}"
+    if history_key not in user_histories:
+        user_histories[history_key] = []
+    
+    ai_response = await get_or_response(full_prompt, user_histories[history_key])
+    
+    user_histories[history_key].append({"role": "user", "content": full_prompt})
+    user_histories[history_key].append({"role": "assistant", "content": ai_response})
+    
+    if len(user_histories[history_key]) > 20:
+        user_histories[history_key] = user_histories[history_key][-20:]
+    
+    try:
+        await message.answer(ai_response, reply_to_message=message)
+    except Exception as e:
+        logger.error(f"Ошибка отправки в чат: {e}")
 
 async def main():
-    # Сначала делаем get_me, чтобы инициализировать бота и узнать username
-    try:
-        bot_me = await bot.get_me()
-        logger.info(f"Запуск бота @{bot_me.username} (ID: {bot_me.id}) для чатов и лички...")
-    except Exception as e:
-        logger.error(f"Не удалось получить информацию о боте: {e}")
-        return
+    logger.info("Попытка запуска и проверки связи с Telegram...")
+    global BOT_USERNAME
+    
+    max_retries = 5
+    bot_me = None
+    
+    for attempt in range(max_retries):
+        try:
+            bot_me = await bot.get_me()
+            BOT_USERNAME = bot_me.username
+            logger.info(f"✅ Успешно! Бот @{BOT_USERNAME} (ID: {bot_me.id}) готов к работе.")
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ Попытка {attempt+1}/{max_retries} не удалась: {e}. Ждем 5 секунд...")
+            await asyncio.sleep(5)
+            
+    if not bot_me:
+        logger.error("❌ Не удалось подключиться к Telegram после 5 попыток. Проверь токен и сеть сервера.")
+        return 
 
+    logger.info("Запуск polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
