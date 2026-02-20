@@ -14,7 +14,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OR_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "qwen/qwen3-next-80b-a3b-instruct:free"
+MODEL_NAME = "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
 
 if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Не найдены переменные TELEGRAM_TOKEN или OPENROUTER_API_KEY!")
@@ -185,6 +185,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
